@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>midi-inverter preview</title>
+<style>
+  /* Vista previa fuera de Live: ejecuta inverter_engine.js e inverter_ui.js tal cual,
+     con stubs de outlet / Global / mgraphics sobre canvas. Los controles imitan
+     a los live.* (aproximados). Toca con el teclado del ordenador (A W S E D F T
+     G Y H U J K, Z/X cambian de octava) o con el ratón en la vista. Sin audio. */
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #111; color: #fff; font-family: "Ableton Sans Medium", Helvetica, Arial, sans-serif;
+         min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+  .device { position: relative; width: 540px; height: 169px; outline: 1px solid #1c1c1c; background: #000; }
+  #c { display: block; width: 300px; height: 169px; cursor: pointer; }
+  .sep { position: absolute; left: 302px; top: 0; width: 1px; height: 169px; background: #1c1c1c; }
+  #panel > * { position: absolute; }
+  #panel canvas { cursor: ns-resize; touch-action: none; }
+  #panel .lbl { font-size: 9px; color: rgba(255,255,255,0.55); }
+  #panel .credit { font-size: 8px; color: rgba(255,255,255,0.3); }
+  #panel .groupsep { left: 378px; top: 14px; width: 1px; height: 136px; background: rgba(255,255,255,0.12); }
+  #panel .dim { opacity: 0.3; }
+  select, input[type=number] { background: #000; color: #fff; border: 1px solid rgba(255,255,255,0.3);
+         font: inherit; font-size: 8px; height: 15px; padding: 0 3px; border-radius: 0; }
+  .tabs { display: flex; }
+  .tabs button, button.tg { height: 15px; font: inherit; font-size: 8px; background: #000;
+         color: rgba(255,255,255,0.6); border: 1px solid rgba(255,255,255,0.35); }
+  .tabs button.on, button.tg.on { background: #fff; color: #000; }
+  .log { position: fixed; bottom: 12px; left: 16px; right: 16px; font-size: 10px;
+         color: rgba(255,255,255,0.35); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @media (max-width: 580px) { .device { transform: scale(0.62); transform-origin: center; } }
+</style>
+</head>
+<body>
+<div class="device">
+  <canvas id="c" width="900" height="507"></canvas>
+  <div class="sep"></div>
+  <div id="panel"></div>
+</div>
+<div class="log" id="log">teclado: A W S E D F T G Y H U J K · Z/X octava · o haz clic en la vista</div>
+<script>
+(async function () {
+  var W = 300, H = 169, DPR = 3;
+  var globals = {};
+  function Global(name) { return globals[name] || (globals[name] = {}); }
+
+  // mgraphics sobre canvas 2D (el subconjunto que usa inverter_ui.js)
+  function rgba(r, gg, b, a) { return 'rgba(' + (r * 255 | 0) + ',' + (gg * 255 | 0) + ',' + (b * 255 | 0) + ',' + a + ')'; }
+  function makeMg(canvas, w, h) {
+    var g = canvas.getContext('2d');
+    var font = { face: 'Helvetica', size: 8 };
+    var pt = [0, 0];
+    function setFont() { g.font = font.size + 'px "' + font.face + '", Helvetica, Arial, sans-serif'; }
+    var mg = {
+      relative_coords: 0, autofill: 0, size: [w, h], dirty: true,
+      init: function () {}, redraw: function () { mg.dirty = true; },
+      set_source_rgba: function (r, gg, b, a) { g.fillStyle = g.strokeStyle = rgba(r, gg, b, a); },
+      rectangle: function (x, y, ww, hh) { g.rect(x, y, ww, hh); },
+      ellipse: function (x, y, ww, hh) { g.moveTo(x + ww, y + hh / 2); g.ellipse(x + ww / 2, y + hh / 2, ww / 2, hh / 2, 0, 0, Math.PI * 2); },
+      move_to: function (x, y) { pt = [x, y]; g.moveTo(x, y); },
+      line_to: function (x, y) { g.lineTo(x, y); },
+      fill: function () { g.fill(); g.beginPath(); }, stroke: function () { g.stroke(); g.beginPath(); },
+      set_line_width: function (lw) { g.lineWidth = lw; }, set_line_cap: function (c) { g.lineCap = c; },
+      select_font_face: function (f) { font.face = f; setFont(); },
+      set_font_size: function (sz) { font.size = sz; setFont(); },
+      text_measure: function (str) { return [g.measureText(str).width, font.size]; },
+      show_text: function (str) { g.fillText(str, pt[0], pt[1]); pt[0] += g.measureText(str).width; },
+      frame: function (paint) {
+        if (!mg.dirty) return;
+        mg.dirty = false;
+        g.setTransform(1, 0, 0, 1, 0, 0);
+        g.clearRect(0, 0, canvas.width, canvas.height);
+        g.setTransform(DPR, 0, 0, DPR, 0, 0);
+        g.beginPath();
+        paint();
+      }
+    };
+    return mg;
+  }
+
+  var NAMES = ['bang', 'note', 'pressure', 'panic', 'axis', 'half', 'mode', 'tonic', 'scale', 'low', 'high',
+    'output', 'flipvel', 'draw', 'paint'];
+  function load(src, env) {
+    var ret = '{' + NAMES.map(function (n) { return n + ': typeof ' + n + ' === "function" ? ' + n + ' : null'; }).join(',') + '}';
+    var f = new Function('outlet', 'Global', 'jsarguments', 'mgraphics', 'box', 'post',
+      'var inlets, outlets, autowatch;\n' + src + '\nreturn ' + ret + ';');
+    return f(env.outlet || function () {}, Global, env.jsarguments, env.mg, { rect: [0, 0].concat(env.mg ? env.mg.size : [0, 0]) }, function () {});
+  }
+
+  var cv = document.getElementById('c');
+  var panel = document.getElementById('panel');
+  var log = document.getElementById('log');
+  var NN = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  function name(p) { return NN[p % 12] + (Math.floor(p / 12) - 2); }
+  var mg = makeMg(cv, W, H);
+  var axisText = null;
+  var sent = [];
+
+  var ui = load(await (await fetch('../inverter_ui.js')).text(), { jsarguments: ['inverter_ui.js'], mg: mg });
+  var engine = load(await (await fetch('../inverter_engine.js')).text(), {
+    jsarguments: ['inverter_engine.js', 'preview'],
+    outlet: function (n) {
+      var a = Array.prototype.slice.call(arguments, 1);
+      if (n === 0 && a[1] > 0) {
+        sent.unshift(name(a[0]) + ' ' + a[1]);
+        sent.length = Math.min(sent.length, 16);
+        log.textContent = 'sale: ' + sent.join('  ');
+      } else if (n === 1) ui.draw(a[1]);
+      else if (n === 2 && axisText) axisText(a[1]);
+    }
+  });
+
+  // mismas posiciones que en tools/build_device.py
+  var AX = 341, NX = 390, NROWS = [11, 47, 83, 119];
+  function place(el, x, y) { el.style.left = x + 'px'; el.style.top = y + 'px'; panel.appendChild(el); return el; }
+  function lbl(text, x, y) { var d = document.createElement('div'); d.className = 'lbl'; d.textContent = text; return place(d, x - 4, y - 3); }
+
+  // knob Axis: imitación del live.dial (arrastre vertical); el valor lo escribe el motor
+  function knob(label, x, y, lo, hi, init, fn) {
+    var c = document.createElement('canvas');
+    c.width = 60 * DPR; c.height = 54 * DPR;
+    c.style.width = '60px'; c.style.height = '54px';
+    place(c, x - 30, y - 3);
+    var g = c.getContext('2d');
+    var v = init, txt = '';
+    function paint() {
+      var cx = 30, cy = 29, r = 12, a0 = 0.75 * Math.PI, a1 = 2.25 * Math.PI;
+      var a = a0 + (v - lo) / (hi - lo) * (a1 - a0);
+      g.setTransform(DPR, 0, 0, DPR, 0, 0);
+      g.fillStyle = '#000'; g.fillRect(0, 0, 60, 54);
+      g.textAlign = 'center'; g.font = '9px Helvetica, Arial, sans-serif'; g.fillStyle = 'rgba(255,255,255,0.55)';
+      g.fillText(label, cx, 10);
+      g.lineWidth = 2.5;
+      g.strokeStyle = 'rgba(255,255,255,0.28)'; g.beginPath(); g.arc(cx, cy, r, a0, a1); g.stroke();
+      g.strokeStyle = '#fff'; g.beginPath(); g.arc(cx, cy, r, a0, a + 0.001); g.stroke();
+      g.lineWidth = 1.5; g.beginPath();
+      g.moveTo(cx + Math.cos(a) * 4, cy + Math.sin(a) * 4); g.lineTo(cx + Math.cos(a) * (r - 1), cy + Math.sin(a) * (r - 1)); g.stroke();
+      g.fillStyle = 'rgba(255,255,255,0.92)';
+      g.fillText(txt, cx, 51);
+    }
+    axisText = function (s) { txt = s; paint(); };
+    var y0 = null, acc = 0;
+    c.addEventListener('pointerdown', function (e) { y0 = e.clientY; acc = 0; c.setPointerCapture(e.pointerId); });
+    c.addEventListener('pointermove', function (e) {
+      if (y0 === null) return;
+      acc += (y0 - e.clientY) / 3; y0 = e.clientY;
+      var d = Math.trunc(acc);
+      if (d) { acc -= d; v = Math.max(lo, Math.min(hi, v + d)); fn(v); paint(); }
+    });
+    c.addEventListener('pointerup', function () { y0 = null; });
+    fn(v); paint();
+  }
+  function toggle(label, text, x, y, w, fn) {
+    var l = lbl(label, x, y);
+    var b = document.createElement('button');
+    b.className = 'tg'; b.textContent = text; b.style.width = w + 'px';
+    b.addEventListener('click', function () { b.classList.toggle('on'); fn(b.classList.contains('on') ? 1 : 0); });
+    place(b, x, y + 14); fn(0);
+    return b;
+  }
+  function tabs(label, x, y, w, items, fn) {
+    lbl(label, x, y);
+    var t = place(document.createElement('div'), x, y + 14); t.className = 'tabs';
+    items.forEach(function (it, i) {
+      var b = document.createElement('button'); b.textContent = it; b.style.width = (w / items.length) + 'px';
+      if (!i) b.className = 'on';
+      b.addEventListener('click', function () {
+        t.querySelectorAll('button').forEach(function (o) { o.className = ''; }); b.className = 'on'; fn(i);
+      });
+      t.appendChild(b);
+    });
+    fn(0);
+  }
+  function select(label, x, y, w, items, init, fn) {
+    var l = lbl(label, x, y);
+    var s = document.createElement('select');
+    s.lbl = l;
+    s.innerHTML = items.map(function (it, i) { return '<option' + (i === init ? ' selected' : '') + '>' + it; }).join('');
+    s.style.width = w + 'px';
+    s.addEventListener('input', function () { fn(s.selectedIndex); });
+    place(s, x, y + 14); fn(init);
+    return s;
+  }
+  function number(label, x, y, init, fn) {
+    lbl(label, x, y);
+    var n = document.createElement('input');
+    n.type = 'number'; n.min = 0; n.max = 127; n.value = init; n.style.width = '64px';
+    n.addEventListener('input', function () { fn(+n.value); });
+    place(n, x, y + 14); fn(init);
+  }
+
+  var scaleOnly = [];
+  knob('Axis', AX, 16, 0, 127, 60, function (v) { engine.axis(v); });
+  toggle('Between', '½', AX - 22, NROWS[2], 44, function (v) { engine.half(v); });
+  place(document.createElement('div'), 378, 14).className = 'groupsep';
+  tabs('Mode', NX, NROWS[0], 134, ['Chromatic', 'Scale'], function (i) {
+    engine.mode(i);
+    scaleOnly.forEach(function (el) { el.classList.toggle('dim', i === 0); el.lbl.classList.toggle('dim', i === 0); });
+  });
+  scaleOnly.push(select('Root', NX, NROWS[1], 40, NN, 0, function (i) { engine.tonic(i); }));
+  scaleOnly.push(select('Scale', NX + 46, NROWS[1], 88, ['Major', 'Minor', 'Dorian', 'Phrygian', 'Lydian', 'Mixolydian',
+    'Harmonic Minor', 'Major Pentatonic', 'Minor Pentatonic', 'Blues'], 0, function (i) { engine.scale(i); }));
+  scaleOnly.forEach(function (el) { el.classList.add('dim'); el.lbl.classList.add('dim'); });
+  number('Low', NX, NROWS[2], 0, function (v) { engine.low(v); });
+  number('High', NX + 70, NROWS[2], 127, function (v) { engine.high(v); });
+  tabs('Output', NX, NROWS[3], 64, ['Mirror', 'Both'], function (i) { engine.output(i); });
+  toggle('Velocity', 'Flip', NX + 70, NROWS[3], 64, function (v) { engine.flipvel(v); });
+  var credit = place(document.createElement('div'), 540 - 16 - 30, 153); credit.className = 'credit'; credit.textContent = 'mxnchv';
+
+  // teclado del ordenador: fila central como un piano, desde C3
+  var KEYS = 'awsedftgyhujk';
+  var octave = 60, down = {};
+  addEventListener('keydown', function (e) {
+    if (e.repeat || e.target.tagName === 'INPUT') return;
+    var k = e.key.toLowerCase(), i = KEYS.indexOf(k);
+    if (k === 'z') octave = Math.max(0, octave - 12);
+    else if (k === 'x') octave = Math.min(108, octave + 12);
+    else if (i >= 0 && !down[k]) { down[k] = octave + i; engine.note(down[k], 100); }
+  });
+  addEventListener('keyup', function (e) {
+    var k = e.key.toLowerCase();
+    if (down[k] !== undefined) { engine.note(down[k], 0); delete down[k]; }
+  });
+  // clic en la vista: toca la tecla de entrada que hay debajo
+  var held = null;
+  cv.addEventListener('pointerdown', function (e) {
+    var S = globals[Object.keys(globals)[0]].state;
+    var x = e.offsetX * (W / cv.clientWidth);
+    held = Math.max(0, Math.min(127, Math.round(S.center + (x - W / 2) / ((W - 16) / 48))));
+    engine.note(held, 100);
+  });
+  addEventListener('pointerup', function () { if (held !== null) { engine.note(held, 0); held = null; } });
+
+  window.inverter = { engine: engine, ui: ui, globals: globals };
+  (function frame() {
+    requestAnimationFrame(frame);
+    mg.redraw();
+    mg.frame(ui.paint);
+  })();
+})().catch(function (e) { document.getElementById('log').textContent = 'error: ' + e.message; throw e; });
+</script>
+</body>
+</html>
